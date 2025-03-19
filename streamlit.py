@@ -5,7 +5,6 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix
 from datetime import datetime
 import torch
 import torch.nn as nn
@@ -20,7 +19,7 @@ from web3 import Web3
 # PART 1: Data Loading & Preprocessing from BigQuery
 # ---------------------------
 @st.cache_data(show_spinner=False)
-def load_data_from_bigquery(limit=10000):
+def load_data_from_bigquery(limit):
     """
     Queries the BigQuery public dataset for Ethereum transactions from the last 6 months.
     Returns a DataFrame limited to a manageable number of rows.
@@ -29,7 +28,7 @@ def load_data_from_bigquery(limit=10000):
     sql = f"""
     SELECT *
     FROM `bigquery-public-data.crypto_ethereum.transactions`
-    WHERE block_timestamp >= TIMESTAMP(DATETIME_SUB(DATETIME(current_timestamp()), INTERVAL 1 MONTH))
+    WHERE block_timestamp >= TIMESTAMP(DATETIME_SUB(DATETIME(current_timestamp()), INTERVAL 6 MONTH))
     ORDER BY block_timestamp
     LIMIT {limit}
     """
@@ -167,22 +166,39 @@ def build_and_train_autoencoder(X_train, X_test):
     best_val_loss = float('inf')
     patience_counter = 0
 
-    num_epochs = 1000
+    num_epochs = 200
     train_loss_history = []
     val_loss_history = []
+    lr_history = []  # To track learning rate per epoch
+    grad_norm_history = []  # To track average gradient norm per epoch
 
     model.train()
     for epoch in range(num_epochs):
         # Training phase
         epoch_train_loss = 0.0
+        batch_grad_norms = []  # List to store gradient norms per batch
         for batch in train_loader:
             batch_X = batch
             optimizer.zero_grad()
             outputs = model(batch_X)
             loss = criterion(outputs, batch_X)
             loss.backward()
+
+            # Compute gradient norm for the current batch
+            total_norm = 0
+            for param in model.parameters():
+                if param.grad is not None:
+                    param_norm = param.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** 0.5
+            batch_grad_norms.append(total_norm)
+
             optimizer.step()
             epoch_train_loss += loss.item() * batch_X.size(0)
+
+        # Record average gradient norm for this epoch
+        avg_grad_norm = np.mean(batch_grad_norms)
+        grad_norm_history.append(avg_grad_norm)
 
         # Validation phase
         epoch_val_loss = 0.0
@@ -193,14 +209,18 @@ def build_and_train_autoencoder(X_train, X_test):
                 outputs = model(batch_X)
                 loss = criterion(outputs, batch_X)
                 epoch_val_loss += loss.item() * batch_X.size(0)
+        model.train()  # Switch back to training mode
 
-        # Calculate metrics
+        # Calculate metrics for this epoch
         avg_train_loss = epoch_train_loss / len(train_loader.dataset)
         avg_val_loss = epoch_val_loss / len(val_loader.dataset)
         train_loss_history.append(avg_train_loss)
         val_loss_history.append(avg_val_loss)
 
-        # Learning rate scheduling
+        # Record the current learning rate
+        lr_history.append(optimizer.param_groups[0]['lr'])
+
+        # Update scheduler
         scheduler.step(avg_val_loss)
 
         # Early stopping check
@@ -218,13 +238,13 @@ def build_and_train_autoencoder(X_train, X_test):
     # Load best model
     model.load_state_dict(torch.load('best_model.pth'))
 
-    # Calculate dynamic threshold using validation set
+    # Calculate dynamic threshold using training set reconstructions
     model.eval()
     with torch.no_grad():
         val_reconstructions = model(torch.tensor(X_train_scaled, dtype=torch.float32))
         val_errors = torch.mean((torch.tensor(X_train_scaled) - val_reconstructions) ** 2, dim=1).numpy()
 
-    # Use 95th percentile for tighter threshold
+    # Use 99th percentile for threshold
     threshold = np.percentile(val_errors, 99)
 
     # Evaluate on test set
@@ -232,11 +252,29 @@ def build_and_train_autoencoder(X_train, X_test):
         test_reconstructions = model(test_tensor)
         test_errors = torch.mean((test_tensor - test_reconstructions) ** 2, dim=1).numpy()
 
-    # Calculate test metrics (if labels available)
-    test_accuracy = None
+    # Calculate test metrics
+    # test_accuracy = (y_test_pred == y_test.values).mean()
     test_loss = criterion(test_reconstructions, test_tensor).item()
 
-    return model, (train_loss_history, val_loss_history), test_loss, test_accuracy, threshold
+    # Optionally, track latent space quality if your model has an encoder.
+    if hasattr(model, 'encoder'):
+        latent_representations = []
+        for batch in DataLoader(train_tensor, batch_size=64):
+            with torch.no_grad():
+                latent = model.encoder(batch)
+            latent_representations.append(latent)
+        latent_representations = torch.cat(latent_representations, dim=0)
+        # Example: compute the average norm of latent vectors
+        latent_norm = latent_representations.norm(dim=1).mean().item()
+        print("Average latent norm:", latent_norm)
+
+    return (model,
+            (train_loss_history, val_loss_history),
+            test_loss,
+            test_errors,
+            threshold,
+            lr_history,
+            grad_norm_history)
 
 
 # ---------------------------
@@ -292,8 +330,6 @@ def fetch_live_transactions(scaler, feature_cols):
     X_live = df_live_scaled[feature_cols]
     return df_live, X_live
 
-
-@st.cache_resource(show_spinner=False)
 def predict_live_transactions(_model, _scaler, threshold, feature_cols):
     """
     Fetches live transactions, computes reconstruction error using the autoencoder,
@@ -339,11 +375,16 @@ def main():
         if X_train is not None:
             if st.button("Train Autoencoder", key="train_autoencoder_button"):
                 with st.spinner("Training the autoencoder..."):
-                    model, loss_history, test_loss, test_accuracy, threshold = build_and_train_autoencoder(X_train, X_temp)
+                    model, loss_history, test_loss, test_errors, threshold, lr_history, grad_norm_history = build_and_train_autoencoder(X_train, X_temp)
                 st.success("Autoencoder trained successfully!")
                 st.write("**Test Loss:**", test_loss)
-                st.write("**Test Accuracy:**", test_accuracy)
                 st.write("**Reconstruction Error Threshold:**", threshold)
+                st.write("### Test Errors")
+                st.line_chart(test_errors)
+                st.write("### LR History")
+                st.line_chart(lr_history)
+                st.write("### Grad Norm History")
+                st.line_chart(grad_norm_history)
                 st.write("### Training Loss Over Epochs")
                 st.line_chart(loss_history[0])
                 st.write("### Validation Loss Over Epochs")
@@ -366,7 +407,7 @@ def main():
             if st.button("Run Live Prediction", key="live_prediction_button"):
                 with st.spinner("Using autoencoder for live prediction..."):
                     # Train autoencoder first (or load a pre-trained model)
-                    model, loss_history, test_loss, test_accuracy, threshold = build_and_train_autoencoder(X_train, X_temp)
+                    model, loss_history, test_loss, test_errors, threshold, lr_history, grad_norm_history = build_and_train_autoencoder(X_train, X_temp)
                 st.success("Autoencoder model is ready!")
                 df_live = predict_live_transactions(model, scaler, threshold, featured_cols)
                 if df_live is not None:
